@@ -204,6 +204,37 @@ def write_log(log_file, content):
         f.write(content)
 
 
+# ---- v3.2.2 主机指纹 ----
+# 为什么要有：记录行是「时分秒|进程|窗口标题」，行内没有主机字段，日期又只靠文件名。
+# 两台机如果被同步/拷贝进同一个 `YYYY-MM-DD.txt`，既分不清来源，统计还会双算
+# （同一天 09:00–18:00 在两台机上是完全重叠的时间段，不是可以相加的量）。
+# 做法：每天在日志里补一条 `HH:MM:SS|[HOST]|<计算机名>`。
+# 解析端（summary.py 里 `parts[1].startswith("[")`）本来就把 `[XXX]` 当标记行、断上下文不计时长，
+# 所以**不用改解析**；这里的标记只用于「一眼看出这份数据是不是本机产的」。
+_host_fingerprint_day = None
+
+
+def ensure_host_fingerprint(log_file, time_str):
+    """当天日志里补一条 [HOST] 标记；已有就跳过。失败不影响计时。"""
+    global _host_fingerprint_day
+    day = os.path.basename(log_file)
+    if _host_fingerprint_day == day:
+        return
+    _host_fingerprint_day = day      # 标成已检，失败也不每轮重试，避免反复读盘
+
+    try:
+        if os.path.exists(log_file):
+            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if "|[HOST]|" in line:
+                        return
+        host = (os.environ.get("COMPUTERNAME") or "").strip().upper() or "UNKNOWN"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"{time_str}|[HOST]|{host}\n")
+    except Exception:                                        # noqa: BLE001
+        pass
+
+
 def format_log_line(time_str, proc, title, last_key):
     """生成一条日志行（v2.6 点压缩）
 
@@ -581,6 +612,7 @@ def main():
         cursor = get_cursor_pos()
         time_str = now.strftime("%H:%M:%S")
         log_file = get_today_file()
+        ensure_host_fingerprint(log_file, time_str)
 
         # v2.7.2：按真实经过时间计时。旧版每轮固定 +10s，循环本身耗时与系统卡顿
         # 会让在线时长系统性偏慢；这里取真实 delta，并对异常跳变（休眠/长时间卡顿）

@@ -135,6 +135,14 @@ def _collect_key():
                     items.append((fp, st.st_size, int(st.st_mtime)))
                 except OSError:
                     pass
+        # v3.2.3 修：原来只 hash 日志文件 ⇒ **改完 category.txt 缓存键不变**，
+        # 面板还拿旧快照（分类归属、各分类秒数都对不上），记录器一停就永远不刷新。
+        # 分类配置也是输入的一部分，必须进 key。
+        try:
+            cst = os.stat(DASH.CAT_FILE)
+            items.append(("|cat|", cst.st_size, int(cst.st_mtime)))
+        except OSError:
+            items.append(("|cat|", -1, -1))
     except Exception:                                        # noqa: BLE001
         return None
     return hash(tuple(items))
@@ -155,6 +163,17 @@ def _collect_cached():
         data = DASH.collect()
         _COLLECT_CACHE["key"], _COLLECT_CACHE["data"] = k, data
         return data
+
+
+def _collect_invalidate():
+    """作废 collect 快照与整页 HTML 缓存（改分类配置后必须调用）。
+
+    v3.2.3：不加这一步，改完分类要等下一次日志写入才生效 —— 记录器停着就永远不生效。
+    """
+    _COLLECT_CACHE["key"] = None
+    _COLLECT_CACHE["data"] = None
+    _HTML_CACHE["key"] = None
+    _HTML_CACHE["html"] = None
 
 # 控制台可能是 GBK：打不出的字符直接替换，别让启动横幅把服务带崩
 if hasattr(sys.stdout, "reconfigure"):
@@ -205,6 +224,7 @@ def cat_edit_payload(payload):
     全部走 parse→改→dump 一条路，dump 内部会先备份 .bak 再原子替换。
     """
     action = (payload.get("action") or "").strip()
+    _collect_invalidate()          # v3.2.3：改分类前先作废旧快照，避免下面读到旧归属
     meta, _dup = CU.parse_category_file(DASH.CAT_FILE)
     if not meta:
         return {"ok": False, "message": "category.txt 读不到（或没有规则）"}
@@ -667,6 +687,41 @@ def backup_payload(payload=None):
     return {"ok": True, "items": _backup_list()}
 
 
+def _local_host_name():
+    """本机计算机名（与 focus_tracker 写进日志的 [HOST] 标记同源）"""
+    return (os.environ.get("COMPUTERNAME") or "").strip().upper()
+
+
+def _check_host_fingerprint(lp):
+    """今日日志里的 [HOST] 标记是否与本机一致。
+
+    v3.2.2：记录行没有主机字段、日期只靠文件名，所以别的机器的日志一旦被同步/拷进来，
+    会静默混进本机统计（同一天的时间段完全重叠，不是可相加的量）。
+    这里只做「发现并红脸」：不同主机 ⇒ ❌ 提示，不自动改数据。
+    升级前的老日志没有标记 ⇒ 不算错，只给一句提示。
+    """
+    if not lp or not os.path.exists(lp):
+        return True, ""
+    mine = _local_host_name()
+    if not mine:
+        return True, ""
+    try:
+        with open(lp, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                # 注意：标记行不一定在文件头 —— 记录器每次重启都会补一条，可能落在任意位置
+                # （首次上线时今天那份已经写到 900 多行了）。所以这里要扫全文件，别只扫开头。
+                p = line.rstrip("\n").split("|")
+                if len(p) >= 3 and p[1] == "[HOST]":
+                    got = p[2].strip().upper()
+                    if got and got != mine:
+                        return False, (f"今日日志来自 {got}（本机 {mine}）"
+                                       " —— 另一台机的记录被同步/拷过来了，本机统计已被污染")
+                    return True, ""
+        return True, "今日日志无主机标记（升级前的旧记录，正常）"
+    except Exception:                                        # noqa: BLE001
+        return True, ""
+
+
 def checkup_payload(payload=None):
     """一键体检（reportEmpty 思想）：小白不用懂原理，看 ✅/❌ 就知道要干什么"""
     items = []
@@ -681,6 +736,8 @@ def checkup_payload(payload=None):
                       "note": "" if age < 600 else f"最后写入是 {int(age/60)} 分钟前（记录可能停了）"})
     else:
         items.append({"name": "今日日志", "ok": False, "note": "今天还没有日志文件"})
+    host_ok, host_note = _check_host_fingerprint(lp)
+    items.append({"name": "日志主机指纹", "ok": host_ok, "note": host_note})
     au = autostart_payload()
     if au.get("enabled"):
         val = (au.get("value") or "").strip('"').lower()

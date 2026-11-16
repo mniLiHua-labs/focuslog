@@ -1,5 +1,5 @@
-# FocusLog  |  Copyright (C) 2026 冰叁狼  |  SPDX-License-Identifier: GPL-3.0-only
-﻿# 清理旧版残留  v2.14.1
+﻿# FocusLog  |  Copyright (C) 2026 冰叁狼  |  SPDX-License-Identifier: GPL-3.0-only
+# 清理旧版残留  v2.14.1
 # 单一实现：根目录「开始记录.bat」和 面板里的「开始记录」都调用本脚本。
 #
 # 为什么需要：旧版（含"双文件夹版"）如果还在开机自启里，旧 exe 会和新版

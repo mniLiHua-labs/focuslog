@@ -114,7 +114,8 @@ def _find_log_file(date_str):
 
 
 _LOG_CACHE = {}          # 日志路径 -> (size, mtime, rows)
-_LOG_CACHE_MAX = 90      # 90 天足够覆盖面板"全部"范围，再多也只是 LRU 淘汰
+_LOG_CACHE_MAX = 400     # v3.2.3：原来 90，但实测历史已有 156 天 ⇒ 槽位不够，
+                         # 每轮刷新都在 LRU 抖动（等于没有缓存）。400 天足够，占内存很小。
 
 
 def parse_log(date_str):
@@ -143,6 +144,18 @@ def parse_log(date_str):
     _LOG_CACHE[log_file] = (key, rows)
     return rows
 
+
+def _hms_to_sec(s):
+    """'HH:MM:SS' -> 当天秒数。
+
+    v3.2.3：原实现每行调一次 datetime.strptime（约 4~5µs），全历史 36.8 万行光这一项
+    就要 1.5~2 秒。这里直接切字符串算秒数（约 0.4µs），且下游只用它做差值，语义完全等价。
+    格式不对返回 None（由调用方跳过该行，与原来 except ValueError 行为一致）。
+    """
+    try:
+        return int(s[0:2]) * 3600 + int(s[3:5]) * 60 + int(s[6:8])
+    except (ValueError, IndexError):
+        return None
 
 def _parse_log_raw(log_file):
     """解析当天的日志文件，返回 [(time_str, proc, title, duration_seconds), ...]
@@ -174,11 +187,10 @@ def _parse_log_raw(log_file):
             if len(parts) == 2 and parts[1].strip() == ".":
                 if last_proc is None:
                     continue  # 文件开头就是省略行（异常），跳过
-                try:
-                    t = datetime.strptime(parts[0], "%H:%M:%S")
-                except ValueError:
+                sec = _hms_to_sec(parts[0])
+                if sec is None:
                     continue
-                records.append((parts[0], last_proc, last_title, t))
+                records.append((parts[0], last_proc, last_title, sec))
                 continue
 
             # ---- 完整行：必须三段 ----
@@ -189,20 +201,19 @@ def _parse_log_raw(log_file):
                 last_proc = None
                 last_title = None
                 continue
-            try:
-                t = datetime.strptime(parts[0], "%H:%M:%S")
-            except ValueError:
+            sec = _hms_to_sec(parts[0])
+            if sec is None:
                 continue
 
             last_proc = parts[1]
             last_title = parts[2]
-            records.append((parts[0], parts[1], parts[2], t))
+            records.append((parts[0], parts[1], parts[2], sec))
 
     # 计算每条记录的持续时长（到下一条的时间差）
     result = []
     for i in range(len(records)):
         if i + 1 < len(records):
-            diff = (records[i + 1][3] - records[i][3]).total_seconds()
+            diff = records[i + 1][3] - records[i][3]      # v3.2.3：已是秒数，直接相减
             # v2.7 修正：间隔超过 60 秒 = 中间发生过暂停/锁屏/空闲，
             # 这一段不该按采样间隔补时，直接记 0（真实中断）。
             # ⚠️ 旧代码在此处写成 diff = 0 也会把「正常的长间隔」判为 0，

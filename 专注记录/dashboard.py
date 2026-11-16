@@ -131,6 +131,29 @@ def collect(days_limit=RECENT_DAYS):
     hourly = [[0.0, 0.0] for _ in range(24)]      # [在线, 专注]
     proc_cat_sec = {}
 
+    # ---- v3.2.3 性能：分类记忆化 ----
+    # 实测 36.8 万条记录里唯一的 (进程, 标题) 只有 9,350 对（2.5%）—— 同一对在同一份
+    # category.txt 下结果恒定。原来每条记录都重跑一遍规则+正则，classify_window 被调
+    # 73 万次、占总耗时 80%（面板「正在统计全部历史」等了 18 秒就是这么来的）。
+    # 这里按 (proc,title) 记忆化：等价改写，口径一字不变，只是不再重复算。
+    _cls_memo, _focus_memo = {}, {}
+
+    def cls_of(proc, title):
+        k = (proc, title)
+        v = _cls_memo.get(k)
+        if v is None:
+            v = classify_window(proc, title, categories) or "未分类"
+            _cls_memo[k] = v
+        return v
+
+    def focus_of(proc, title):
+        k = (proc, title)
+        v = _focus_memo.get(k)
+        if v is None:
+            v = bool(is_focus_window(proc, title, focus_cats))
+            _focus_memo[k] = v
+        return v
+
     for d in all_dates:
         records = S.parse_log(d)
         if not records:
@@ -146,10 +169,10 @@ def collect(days_limit=RECENT_DAYS):
             if dur <= 0:
                 continue
             total += dur
-            c = classify_window(proc, title, categories) or "未分类"
+            c = cls_of(proc, title)
             cats[c] = cats.get(c, 0) + dur
             apps[proc] = apps.get(proc, 0) + dur
-            is_focus = is_focus_window(proc, title, focus_cats)
+            is_focus = focus_of(proc, title)
             if is_focus:
                 focus += dur
             wins[f"{proc} | {title}"] = wins.get(f"{proc} | {title}", 0) + dur
@@ -394,8 +417,22 @@ HTML = r"""<!DOCTYPE html>
           <option value="name">进程名</option>
           <option value="cat">所属分类</option>
         </select>
+        <select id="minSec" title="累计用时不到这个门槛的进程不列出来（几十秒的杂项默认隐藏）">
+          <option value="0">全部时长</option>
+          <option value="60">≥ 1 分钟</option>
+          <option value="300" selected>≥ 5 分钟</option>
+          <option value="1800">≥ 30 分钟</option>
+          <option value="3600">≥ 1 小时</option>
+        </select>
         <label class="tip" style="margin:0"><input type="checkbox" id="showAll"> 含已分类进程</label>
         <label class="tip" style="margin:0"><input type="checkbox" id="newFocus"> 新建分类标为专注</label>
+        <span style="width:1px;height:18px;background:var(--line);margin:0 2px"></span>
+        <button class="btn" id="btnSelPage">全选本页</button>
+        <button class="btn" id="btnSelNone">清空勾选</button>
+        <select id="bulkTo" title="先勾选若干行，再选一个分类，点「应用到已勾选」">
+          <option value="">（批量调整到…）</option>
+        </select>
+        <button class="btn" id="btnBulk">应用到已勾选</button>
         <button class="btn" id="btnReload">刷新列表</button>
         <button class="btn primary" id="btnSave">保存勾选的调整</button>
         <button class="btn" id="btnMaintain">立即维护</button>
@@ -993,6 +1030,9 @@ async function api(path, body){
 
 /* ---------- 工具：分类助手 / 分类管理 ---------- */
 let ALLCAT = null;          // /api/categories 的结果
+let ASSIST_PAGE = 1;        // 分类助手分页（v3.2.3）
+const ASSIST_PAGE_SIZE = 50;
+const ASSIST_SEL = new Map();   // 全局下标 -> {to, newName}；翻页不丢勾选
 
 async function api(path, body){
   const r = await fetch(path, {method:'POST',
@@ -1019,6 +1059,13 @@ async function loadCats(){
     const r = await api('/api/categories');
     ALLCAT = r;
     const un = (r.procs || []).filter(p => !p.cat || p.cat === '未分类').length;
+    const bt = document.getElementById('bulkTo');
+    if (bt){
+      const keep = bt.value;
+      bt.innerHTML = '<option value="">（批量调整到…）</option>'
+        + (D.catOrder || []).filter(c => c !== '未分类').map(c => `<option>${esc(c)}</option>`).join('');
+      bt.value = keep;
+    }
     hint.textContent = `共 ${r.cats.length} 个分类 / ${r.procs.length} 个进程`
       + `（其中还没归类的 ${un} 个）`
       + (r.dup && r.dup.length ? `　⚠ 重复分类名：${r.dup.join('、')}` : '');
@@ -1032,7 +1079,10 @@ function assistRows(){
   if (!ALLCAT) return [];
   const onlyUn = !document.getElementById('showAll').checked;
   const q = document.getElementById('q').value.trim().toLowerCase();
-  let rows = ALLCAT.procs.filter(r => !onlyUn || !r.cat || r.cat === '未分类');
+  // v3.2.3：按累计时长设门槛 —— 几年前跑过几十秒的杂项进程不该来挤占待办列表
+  const minSec = Number(document.getElementById('minSec').value || 0);
+  let rows = ALLCAT.procs.filter(r => (!onlyUn || !r.cat || r.cat === '未分类')
+                                     && (r.sec || 0) >= minSec);
   if (q) rows = rows.filter(r => r.proc.toLowerCase().includes(q));
   const by = document.getElementById('sortBy').value;
   rows.sort((a,b) => {
@@ -1047,11 +1097,27 @@ function assistRows(){
 function renderAssist(){
   const box = document.getElementById('assistTable');
   if (!ALLCAT){ box.innerHTML = ''; return; }
-  const rows = assistRows().slice(0, 200);
+  // v3.2.3：先取全量过滤结果，再只渲染当前页（原来 slice(0,200) 一页堆 200 行，没法翻）
+  const all = assistRows();
+  const pages = Math.max(1, Math.ceil(all.length / ASSIST_PAGE_SIZE));
+  if (ASSIST_PAGE > pages) ASSIST_PAGE = pages;
+  if (ASSIST_PAGE < 1) ASSIST_PAGE = 1;
+  const start = (ASSIST_PAGE - 1) * ASSIST_PAGE_SIZE;
+  const rows = all.slice(start, start + ASSIST_PAGE_SIZE);
+
+  const hint = document.getElementById('assistHint');
+  if (hint) hint.textContent = `共 ${(ALLCAT.procs || []).length} 个进程`
+    + `（其中还没归类的 ${(ALLCAT.procs || []).filter(p => !p.cat || p.cat === '未分类').length} 个）`
+    + `　当前筛选出 ${all.length} 个`
+    + (all.length > ASSIST_PAGE_SIZE ? `，第 ${ASSIST_PAGE}/${pages} 页` : '');
+
   if (!rows.length){
-    const all = (ALLCAT.procs || []).length;
-    box.innerHTML = `<div class="tip">没有符合条件的进程${all && !document.getElementById('showAll').checked
-      ? '　（只显示"还没归类"的进程；想看你已经归好类的，勾上「含已分类进程」）' : ''}</div>`;
+    const tot = (ALLCAT.procs || []).length;
+    box.innerHTML = `<div class="tip">没有符合条件的进程`
+      + `${tot && !document.getElementById('showAll').checked
+          ? '　（只显示"还没归类"的进程；想看你已经归好类的，勾上「含已分类进程」）' : ''}`
+      + `${Number(document.getElementById('minSec').value || 0) > 0
+          ? '　（也可以把「门槛」调成「全部时长」看看用时很短的杂项）' : ''}</div>`;
     return;
   }
   const opts = D.catOrder.filter(c => c !== '未分类')
@@ -1059,28 +1125,82 @@ function renderAssist(){
   box.innerHTML = `<table><thead><tr>
       <th style="width:30%">进程</th><th>累计</th><th>天数</th>
       <th style="width:18%">当前分类</th><th style="width:22%">调整到</th><th style="width:8%">应用</th>
-    </tr></thead><tbody>` + rows.map((r,i) => `<tr>
+    </tr></thead><tbody>` + rows.map((r,k) => { const i = start + k; return `<tr>
       <td title="${esc(r.proc)}">${esc(r.proc)}</td>
       <td>${hm(r.sec)}</td><td>${r.days}</td>
       <td>${r.cat ? `<span class="pill">${esc(r.cat)}</span>` : '<span class="pill">未分类</span>'}</td>
-      <td><select data-i="${i}"><option value="">（不调整）</option>
+      <td><select data-i="${i}" data-cur="${esc(r.cat || '')}"><option value="">（不调整）</option>
             <option value="__new__">（新建分类…）</option>${opts}</select>
           <input type="text" data-new="${i}" placeholder="新分类名"
                  style="width:96px;margin-left:4px;display:none"></td>
-      <td><input type="checkbox" data-f="${i}"></td></tr>`).join('') + '</tbody></table>';
-  box.querySelectorAll('select[data-i]').forEach(s => {
-    s.onchange = () => {
-      const inp = box.querySelector(`input[data-new="${s.dataset.i}"]`);
-      inp.style.display = s.value === '__new__' ? 'inline-block' : 'none';
-      if (s.value) box.querySelector(`input[data-f="${s.dataset.i}"]`).checked = true;
+      <td><input type="checkbox" data-f="${i}" ${ASSIST_SEL.has(i) ? 'checked' : ''}></td></tr>`; }).join('') + '</tbody></table>';
+  // v3.2.3：勾选/选择都记进 ASSIST_SEL（全局下标），翻页后回来还是原样
+  const pickOf = i => ASSIST_SEL.get(i) || {to: '', newName: ''};
+  box.querySelectorAll('select[data-i]').forEach(sel => {
+    const i = +sel.dataset.i;
+    const st = pickOf(i);
+    if (st.to) { sel.value = st.to; if (st.to === '__new__')
+      box.querySelector(`input[data-new="${i}"]`).style.display = 'inline-block'; }
+    if (st.newName) box.querySelector(`input[data-new="${i}"]`).value = st.newName;
+    sel.onchange = () => {
+      const inp = box.querySelector(`input[data-new="${i}"]`);
+      inp.style.display = sel.value === '__new__' ? 'inline-block' : 'none';
+      const cur = pickOf(i); cur.to = sel.value; ASSIST_SEL.set(i, cur);
+      if (sel.value) box.querySelector(`input[data-f="${i}"]`).checked = true;
     };
   });
-  box._rows = rows;
+  box.querySelectorAll('input[data-new]').forEach(inp => {
+    inp.oninput = () => { const i = +inp.dataset.new;
+      const cur = pickOf(i); cur.newName = inp.value; ASSIST_SEL.set(i, cur); };
+  });
+  box.querySelectorAll('input[data-f]').forEach(cb => {
+    cb.onchange = () => { const i = +cb.dataset.f;
+      if (cb.checked) { const cur = pickOf(i); ASSIST_SEL.set(i, cur); }
+      else ASSIST_SEL.delete(i); };
+  });
+  box._rows = all;          // ⚠ 必须是全量过滤结果：保存时按 data-i 的全局下标取行
+
+  // 分页条（v3.2.3）
+  if (pages > 1){
+    const pager = document.createElement('div');
+    pager.className = 'row';
+    pager.style.cssText = 'margin-top:8px;align-items:center;gap:8px';
+    pager.innerHTML = `<button class="btn" id="apv" ${ASSIST_PAGE <= 1 ? 'disabled' : ''}>← 上一页</button>
+      <span class="tip" style="margin:0">第 ${ASSIST_PAGE} / ${pages} 页（共 ${all.length} 个，每页 ${ASSIST_PAGE_SIZE}）</span>
+      <button class="btn" id="anx" ${ASSIST_PAGE >= pages ? 'disabled' : ''}>下一页 →</button>
+      <button class="btn" id="afl">跳到首页</button>`;
+    box.appendChild(pager);
+    pager.querySelector('#apv').onclick = () => { ASSIST_PAGE--; renderAssist(); };
+    pager.querySelector('#anx').onclick = () => { ASSIST_PAGE++; renderAssist(); };
+    pager.querySelector('#afl').onclick = () => { ASSIST_PAGE = 1; renderAssist(); };
+  }
 }
 
-document.getElementById('showAll').onchange = renderAssist;
-document.getElementById('q').oninput = renderAssist;
-document.getElementById('sortBy').onchange = renderAssist;
+const resetPage = () => { ASSIST_PAGE = 1; ASSIST_SEL.clear(); renderAssist(); };
+
+/* --- v3.2.3 批量操作：235 个待分类里 200 多个是游戏，逐个点不现实 --- */
+document.getElementById('btnSelPage').onclick = () => {
+  const box = document.getElementById('assistTable');
+  box.querySelectorAll('input[data-f]').forEach(cb => {
+    const i = +cb.dataset.f; cb.checked = true;
+    ASSIST_SEL.set(i, ASSIST_SEL.get(i) || {to: '', newName: ''});
+  });
+};
+document.getElementById('btnSelNone').onclick = () => { ASSIST_SEL.clear(); renderAssist(); };
+document.getElementById('btnBulk').onclick = () => {
+  const to = document.getElementById('bulkTo').value;
+  const out = document.getElementById('catOut') || document.getElementById('assistHint');
+  if (!to){ if (out) out.textContent = '先在右下「批量调整到…」里选一个分类'; return; }
+  if (!ASSIST_SEL.size){ if (out) out.textContent = '先勾选要调整的行（或用「全选本页」）'; return; }
+  ASSIST_SEL.forEach((v, i) => { ASSIST_SEL.set(i, {to: to, newName: ''}); });
+  renderAssist();
+  if (out) out.textContent = `已把 ${ASSIST_SEL.size} 行设为「${to}」，点「保存勾选的调整」写入 category.txt`;
+};
+document.getElementById('showAll').onchange = resetPage;
+document.getElementById('q').oninput = () => { clearTimeout(window._aqt);
+  window._aqt = setTimeout(resetPage, 150); };      // 输入防抖，别每敲一个字都重排 300 行
+document.getElementById('sortBy').onchange = resetPage;
+document.getElementById('minSec').onchange = resetPage;
 document.getElementById('btnReload').onclick = loadCats;
 
 document.getElementById('btnSave').onclick = async () => {
@@ -1088,14 +1208,15 @@ document.getElementById('btnSave').onclick = async () => {
   const rows = box._rows || [];
   const focusNew = document.getElementById('newFocus').checked;
   const jobs = [];
-  box.querySelectorAll('select[data-i]').forEach(s => {
-    const i = +s.dataset.i;
-    if (!box.querySelector(`input[data-f="${i}"]`).checked) return;
-    let to = s.value;
-    if (to === '__new__') to = (box.querySelector(`input[data-new="${i}"]`).value || '').trim();
+  // v3.2.3：从跨页勾选状态取，不再依赖 DOM（翻页后上一页的勾选也照样提交）
+  ASSIST_SEL.forEach((v, i) => {
+    const r = rows[i];
+    if (!r) return;
+    let to = v.to;
+    if (to === '__new__') to = (v.newName || '').trim();
     if (!to) return;
-    if (to === rows[i].cat) return;
-    jobs.push({action:'move_rule', proc: rows[i].proc, to: to, focus: focusNew});
+    if (to === r.cat) return;
+    jobs.push({action:'move_rule', proc: r.proc, to: to, focus: focusNew});
   });
   if (!jobs.length){ out.textContent = '没有需要应用的行（先选「调整到」并勾选）'; return; }
   out.textContent = '正在写入…';
@@ -1105,7 +1226,10 @@ document.getElementById('btnSave').onclick = async () => {
     done.push((r.ok ? '✓ ' : '✗ ') + (r.message || ''));
   }
   out.textContent = done.join('\n') + '\n（共 ' + jobs.length + ' 条）';
+  ASSIST_SEL.clear();
   await loadCats();
+  // 分类配置变了 ⇒ 首页趋势/今日/分类统计都得重算。等 1.2 秒让人看清结果再刷。
+  setTimeout(() => { try { location.reload(); } catch (e) {} }, 1200);
 };
 
 /* --- 分类管理：改名 / 切专注 / 规则增删 --- */
